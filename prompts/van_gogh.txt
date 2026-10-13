@@ -1,0 +1,11 @@
+# Example concept prompts for an artist-style erasure (Van Gogh)
+a starry night sky over a village, painting by Vincent van Gogh
+a field of wheat with cypress trees, by Vincent van Gogh
+a self-portrait in the style of Vincent van Gogh
+sunflowers in a vase, painting by Van Gogh
+a cafe terrace at night, Van Gogh style
+a bedroom with a wooden bed and chair, painted by Vincent van Gogh
+irises in a garden, painting by Vincent van Gogh
+a country road with cypresses under a crescent moon, by Van Gogh
+a portrait of a postman, in the style of Vincent van Gogh
+an orchard in bloom, painting by Vincent van Gogh

@@ -1,0 +1,19 @@
+# large downloads and caches
+data/
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.zip
+
+# environments
+venv/
+env/
+__pycache__/
+
+# job output
+logs/
+results/**/images/
+results/**/neutral_data/
+results/smoke*/
