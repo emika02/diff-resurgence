@@ -25,6 +25,8 @@ from dataclasses import dataclass
 import torch
 
 # Prefixes some repos put in front of diffusers-style keys.
+# Random-edit directions use seeds from this offset on, so they never coincide with noise seeds.
+RANDOM_EDIT_SEED_OFFSET = 1_000_000
 _PREFIXES = ("unet.", "text_encoder.", "module.", "model.")
 
 
@@ -206,21 +208,33 @@ class EditApplier:
             self._global_cache[seed] = (c, math.sqrt(dd) / orth_norm)
         return self._global_cache[seed]
 
+    def _noise_for(self, i: int, name: str, d: torch.Tensor, seed: int, coeffs) -> torch.Tensor:
+        y = self._raw_noise(i, name, seed)
+        if coeffs is None:
+            return _orthogonal_same_norm(y, d)
+        c, s = coeffs
+        return (y - c * d) * s
+
     @torch.no_grad()
-    def apply(self, a: float = 1.0, b: float = 0.0, seed: int = 0):
-        coeffs = self._global_coeffs(seed) if (b != 0.0 and self.noise_mode == "global") else None
+    def apply(self, a: float = 1.0, b: float = 0.0, seed: int = 0, r: float = 0.0, r_seed: int = 0):
+        """Write base + a*delta + b*noise(seed) + r*random_edit(r_seed) into the model.
+
+        The random edit is built exactly like the noise (orthogonal to delta, same norm as delta,
+        per tensor or global) but from a separate seed range, so it never coincides with a noise
+        direction. It stands in for "some other edit of the same size in the same weights".
+        """
+        rs = RANDOM_EDIT_SEED_OFFSET + int(r_seed)
+        glob = self.noise_mode == "global"
+        cy = self._global_coeffs(seed) if (b != 0.0 and glob) else None
+        cr = self._global_coeffs(rs) if (r != 0.0 and glob) else None
         for i, name in enumerate(self.edit.names):
             base = self.edit.base[name].to(self.device)
             d = self.edit.delta[name].to(self.device)
             w = base + a * d
             if b != 0.0:
-                y = self._raw_noise(i, name, seed)
-                if coeffs is None:
-                    y = _orthogonal_same_norm(y, d)
-                else:
-                    c, s = coeffs
-                    y = (y - c * d) * s
-                w = w + b * y
+                w = w + b * self._noise_for(i, name, d, seed, cy)
+            if r != 0.0:
+                w = w + r * self._noise_for(i, name, d, rs, cr)
             t = self.targets[name]
             t.data.copy_(w.to(t.dtype))
 

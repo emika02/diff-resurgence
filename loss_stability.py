@@ -11,6 +11,10 @@ Conditions (y = random noise orthogonal to the edit, same norm as the edit):
     base_noise(eps)    base + eps*y                            sharpness around the original model
     orthogonal(eps)    base + sqrt(1-eps^2)*delta + eps*y      rotation, as in run_stability.py (eps <= 1)
     scale(alpha)       base + alpha*delta                      neutral-loss cost of the edit itself
+  with --random-edits K (control: is the erasure special, or would any edit of this size do?):
+    random_edit_r<k>   base + R_k                              a random edit: same weights, same norm as delta
+    random_noise_r<k>(eps)  base + R_k + eps*y                 sharpness around that random edit
+  (R_k is random, orthogonal to delta and as large as delta, like y but from its own seeds)
 
 Everything is evaluated on one fixed batch: the same images, captions, timesteps and added
 noise for every condition, so loss differences are paired and small changes are measurable.
@@ -70,6 +74,9 @@ def parse_args():
                    help="extra edit strengths for 'scale'; 0 and 1 are always computed as references")
     g.add_argument("--noise-seeds", type=int, nargs="+", default=[0, 1, 2])
     g.add_argument("--noise-mode", default="per_tensor", choices=["per_tensor", "global"])
+    g.add_argument("--random-edits", type=int, default=0,
+                   help="number of random edits (same tensors, same norm as the erasure edit) to use as a "
+                        "control; each adds 1 + len(eps) * len(noise-seeds) conditions")
 
     g = p.add_argument_group("evaluation")
     g.add_argument("--t-bins", type=int, default=10, help="timestep bins; one timestep per image per bin")
@@ -200,19 +207,29 @@ def denoising_losses(pipe, sched, fixed, text_emb, args) -> np.ndarray:
 
 
 def build_conditions(args):
-    """(condition, level, edit_coef, noise_coef, noise_seed, reference). References come first."""
-    conds = [("scale", 0.0, 0.0, 0.0, -1, "base"), ("scale", 1.0, 1.0, 0.0, -1, "base")]
+    """List of dicts: condition, level, a (edit), b (noise), seed, r (random edit), r_seed,
+    ref (whose losses the deltas are measured against), provides (reference key this condition
+    defines, or None). References come first."""
+    def c(cond, level, a=0.0, b=0.0, seed=-1, r=0.0, r_seed=0, ref="base", provides=None):
+        return dict(cond=cond, level=float(level), a=a, b=b, seed=seed, r=r, r_seed=r_seed,
+                    ref=ref, provides=provides)
+
+    conds = [c("scale", 0.0, provides="base"), c("scale", 1.0, a=1.0, provides="erased")]
+    for k in range(args.random_edits):
+        conds.append(c(f"random_edit_r{k}", 1.0, r=1.0, r_seed=k, provides=f"random_r{k}"))
     eps = sorted(e for e in args.eps if e > 0)
     if "scale" in args.conditions:
-        conds += [("scale", a, a, 0.0, -1, "base") for a in sorted(args.alphas) if a not in (0.0, 1.0)]
+        conds += [c("scale", a, a=a) for a in sorted(args.alphas) if a not in (0.0, 1.0)]
     for e in eps:
-        for s in args.noise_seeds:
+        for s_ in args.noise_seeds:
             if "erased_noise" in args.conditions:
-                conds.append(("erased_noise", e, 1.0, e, s, "erased"))
+                conds.append(c("erased_noise", e, a=1.0, b=e, seed=s_, ref="erased"))
             if "base_noise" in args.conditions:
-                conds.append(("base_noise", e, 0.0, e, s, "base"))
+                conds.append(c("base_noise", e, b=e, seed=s_, ref="base"))
+            for k in range(args.random_edits):
+                conds.append(c(f"random_noise_r{k}", e, b=e, seed=s_, r=1.0, r_seed=k, ref=f"random_r{k}"))
             if "orthogonal" in args.conditions and e <= 1:
-                conds.append(("orthogonal", e, math.sqrt(max(0.0, 1 - e * e)), e, s, "erased"))
+                conds.append(c("orthogonal", e, a=math.sqrt(max(0.0, 1 - e * e)), b=e, seed=s_, ref="erased"))
     return conds
 
 
@@ -258,28 +275,31 @@ def main():
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         if write_header:
             writer.writeheader()
-        for cond, level, a, b, seed, ref in build_conditions(args):
+        for cd in build_conditions(args):
+            cond, level, a, b, seed, ref = cd["cond"], cd["level"], cd["a"], cd["b"], cd["seed"], cd["ref"]
             key = (cond, round(level, 6), seed)
             npy = os.path.join(args.out, "losses", f"{cond}_{level:g}_s{seed}.npy")
-            is_ref = cond == "scale" and level in (0.0, 1.0)
+
+            def evaluate():
+                applier.apply(a, b, seed=max(seed, 0), r=cd["r"], r_seed=cd["r_seed"])
+                emb = text_cache if text_cache is not None else encode_text(pipe, fixed, args)
+                return denoising_losses(pipe, sched, fixed, emb, args)
+
             if key in done:
-                if is_ref:  # references are needed for the deltas of the remaining conditions
-                    L = np.load(npy) if os.path.exists(npy) else None
-                    if L is None:
-                        applier.apply(a, b, seed=0)
-                        emb = text_cache if text_cache is not None else encode_text(pipe, fixed, args)
-                        L = denoising_losses(pipe, sched, fixed, emb, args)
+                if cd["provides"]:  # references are needed for the deltas of the remaining conditions
+                    if os.path.exists(npy):
+                        L = np.load(npy)
+                    else:
+                        L = evaluate()
                         np.save(npy, L)
-                    refs["base" if level == 0.0 else "erased"] = L
+                    refs[cd["provides"]] = L
                 continue
 
             t0 = time.time()
-            applier.apply(a, b, seed=max(seed, 0))
-            emb = text_cache if text_cache is not None else encode_text(pipe, fixed, args)
-            L = denoising_losses(pipe, sched, fixed, emb, args)
+            L = evaluate()
             np.save(npy, L)
-            if is_ref:
-                refs["base" if level == 0.0 else "erased"] = L
+            if cd["provides"]:
+                refs[cd["provides"]] = L
 
             R = refs[ref]
             common = {"name": args.name, "component": args.component, "condition": cond, "level": level,
@@ -295,7 +315,7 @@ def main():
                              "loss_mean": L.mean(), "delta_mean": d.mean(),
                              "delta_se": d.std(ddof=1) / math.sqrt(fixed.n)})
             f.flush()
-            print(f"[{cond:>12s} {level:<5g} seed {seed:>2d}] loss {L.mean():.5f}  "
+            print(f"[{cond:>16s} {level:<5g} seed {seed:>2d}] loss {L.mean():.5f}  "
                   f"change vs {ref}: {d.mean():+.2e} ± {d.std(ddof=1) / math.sqrt(fixed.n):.1e}  "
                   f"({time.time() - t0:.0f}s)")
 
